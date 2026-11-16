@@ -1,0 +1,4 @@
+# Ingot config
+[ingot]
+name = "fe_math_merkle"
+version = "0.1.0"

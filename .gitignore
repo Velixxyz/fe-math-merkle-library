@@ -1,0 +1,13 @@
+/out/
+/target/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Foundry build outputs + fetched dependencies (not vendored).
+/bench/out/
+/bench/cache/
+/bench/lib/
+
+# Private submission credentials (never commit).
+.submission.json
