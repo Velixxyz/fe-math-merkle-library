@@ -1,0 +1,81 @@
+//! Gas-measurement harness for the benchmarks in `bench/`.
+//!
+//! This contract is NOT part of the library API. It exposes library
+//! functions as external calls so Forge can measure their gas with
+//! realistic calldata, next to an OpenZeppelin Solidity baseline compiled
+//! with the same inputs. See `BENCHMARKS.md` for the method and results,
+//! and `tools/gen_bench.py` for the test generator (the Forge test embeds
+//! this contract's compiled bytecode, so benchmarks always measure the
+//! exact artifact `fe build` produced).
+
+use core::fixed::Wad
+use core::num::mul_div
+use std::abi::DynArray
+use std::evm::merkle
+use ingot::fixedx::{UFixedExt, mul_div_nearest}
+use ingot::multiproof::{self, leaf_from_words}
+
+msg BenchMsg {
+    #[selector = sol("verifySingle(uint256[],uint256,uint256)")]
+    VerifySingle { proof: DynArray<u256>, root: u256, leaf: u256 } -> bool,
+    #[selector = sol("verifyMulti(uint256[],bool[],uint256,uint256[])")]
+    VerifyMulti {
+        proof: DynArray<u256>,
+        proof_flags: DynArray<bool>,
+        root: u256,
+        leaves: DynArray<u256>,
+    } -> bool,
+    #[selector = sol("mulDivNearest(uint256,uint256,uint256)")]
+    MulDivNearest { a: u256, b: u256, d: u256 } -> u256,
+    #[selector = sol("mulDivFloor(uint256,uint256,uint256)")]
+    MulDivFloor { a: u256, b: u256, d: u256 } -> u256,
+    #[selector = sol("wadMulNearest(uint256,uint256)")]
+    WadMulNearest { a: u256, b: u256 } -> u256,
+    #[selector = sol("wadMulFloor(uint256,uint256)")]
+    WadMulFloor { a: u256, b: u256 } -> u256,
+    #[selector = sol("powSigned(uint256,int256)")]
+    PowSigned { base: u256, exp: i256 } -> u256,
+    #[selector = sol("compound(uint256,uint256,uint256)")]
+    Compound { principal: u256, rate: u256, periods: u256 } -> u256,
+    #[selector = sol("leafFromWords(uint256,address,uint256)")]
+    LeafFromWords { index: u256, account: Address, amount: u256 } -> u256,
+}
+
+pub contract BenchHarness {
+    init() {}
+
+    recv BenchMsg {
+        VerifySingle { proof, root, leaf } -> bool {
+            merkle::verify(proof: proof, root: root, leaf: leaf)
+        }
+        VerifyMulti { proof, proof_flags, root, leaves } -> bool {
+            multiproof::verify_multi_proof(
+                proof: proof,
+                proof_flags: proof_flags,
+                root: root,
+                leaves: leaves,
+            )
+        }
+        MulDivNearest { a, b, d } -> u256 {
+            mul_div_nearest(a, b, d)
+        }
+        MulDivFloor { a, b, d } -> u256 {
+            mul_div(a, b, d)
+        }
+        WadMulNearest { a, b } -> u256 {
+            Wad::from_raw(a).mul_nearest(Wad::from_raw(b)).raw()
+        }
+        WadMulFloor { a, b } -> u256 {
+            (Wad::from_raw(a) * Wad::from_raw(b)).raw()
+        }
+        PowSigned { base, exp } -> u256 {
+            Wad::from_raw(base).pow_signed(exp).raw()
+        }
+        Compound { principal, rate, periods } -> u256 {
+            Wad::from_raw(principal).compound(Wad::from_raw(rate), periods).raw()
+        }
+        LeafFromWords { index, account, amount } -> u256 {
+            leaf_from_words([index, account.word(), amount])
+        }
+    }
+}

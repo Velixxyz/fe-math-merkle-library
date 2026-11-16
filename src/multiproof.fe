@@ -1,0 +1,215 @@
+//! Merkle multiproofs and leaf encodings.
+//!
+//! `std::evm::merkle` verifies one leaf at a time. This module adds the two
+//! pieces a distributor or airdrop contract needs on top of it:
+//!
+//! * **Multiproofs** — prove many leaves against one root with a single
+//!   shared proof, matching OpenZeppelin's `MerkleProof.processMultiProof`
+//!   / `multiProofVerify` (v5) step for step, including its length check,
+//!   its unconsumed-proof check, and its empty-set edge cases. A batch of
+//!   `k` leaves costs one verification pass instead of `k`.
+//! * **Leaf encodings** — the double-keccak leaf hashes of OpenZeppelin's
+//!   standard Merkle tree, so leaves built off-chain with
+//!   `@openzeppelin/merkle-tree` verify on-chain here.
+//!
+//! Like `std::evm::merkle`, every function here treats leaves as opaque
+//! 32-byte words and never hashes them implicitly: callers build leaves with
+//! the helpers below (or their own encoding) and pass the digests in.
+//! Leaves must not be 64-byte values that could be read as a pair of
+//! internal nodes, or an internal node can be proven as a leaf — the
+//! double hash in the helpers below is what keeps the two domains apart.
+//!
+//! Multiproofs carry OpenZeppelin's own caveat: not every tree admits one.
+//! The tree must be complete, and the leaves must be supplied in the order
+//! the queue consumes them (see `process_multi_proof`). The test vectors in
+//! `vectors/merkle_vectors.json` were generated with an independent Python
+//! implementation of the same algorithm and cross-checked against a second,
+//! literal port of OpenZeppelin's Solidity; this module is not its own
+//! oracle.
+
+use core::ptr::{self, MemSlice, MemSpan}
+use std::abi::DynArray
+use std::evm::crypto
+use std::evm::merkle::{self, ProofNodes}
+use std::evm::packed::{EncodePacked, keccak_packed}
+
+/// A sequence of multiproof flags: one per hash step, ordered the way the
+/// queue consumes them.
+///
+/// A set flag means "combine the next two queued values" (two leaves, two
+/// computed hashes, or one of each); a clear flag means "combine the next
+/// queued value with the next proof element". Word sources treat any
+/// nonzero word as set; `DynArray<bool>` elements decode through the
+/// regular ABI path, so a non-canonical word reverts on read.
+pub trait ProofFlags {
+    /// The number of flags.
+    fn flag_len(self) -> usize
+    /// Whether flag `index` is set. Fails if `index` is out of range.
+    fn flag_at(self, _ index: usize) -> bool
+}
+
+impl ProofFlags for MemSlice<u256> {
+    fn flag_len(self) -> usize {
+        self.len()
+    }
+    fn flag_at(self, _ index: usize) -> bool {
+        self[index] != 0
+    }
+}
+
+impl ProofFlags for DynArray<bool> {
+    fn flag_len(self) -> usize {
+        self.len()
+    }
+    fn flag_at(self, _ index: usize) -> bool {
+        self.get(index)
+    }
+}
+
+impl ProofFlags for DynArray<u256> {
+    fn flag_len(self) -> usize {
+        self.len()
+    }
+    fn flag_at(self, _ index: usize) -> bool {
+        self.get(index) != 0
+    }
+}
+
+/// The root implied by `leaves` and a multiproof (`proof`, `proof_flags`).
+///
+/// This is OpenZeppelin's `MerkleProof.processMultiProof`, with the same
+/// queue walk: values are consumed from the leaves first and then from the
+/// hashes computed by earlier steps, and each step combines the next queued
+/// value with either another queued value (flag set) or the next proof
+/// element (flag clear), using the sorted-pair hash. The last computed
+/// hash is the root.
+///
+/// Fails (reverts) exactly where OpenZeppelin reverts
+/// `MerkleProofInvalidMultiproof`:
+/// * `leaves.len() + proof.len() != proof_flags.len() + 1`,
+/// * a proof element is left unconsumed after the last step,
+/// * the queue runs dry mid-walk (a flag pattern no tree can produce).
+///
+/// Edge cases, as in OpenZeppelin: with no flags and one leaf the leaf
+/// itself is the root (a one-leaf tree); with no flags and no leaves the
+/// single proof element is the root (the empty set, a no-op proof).
+/// Callers that must reject the empty set should check `leaves` is
+/// non-empty before calling.
+pub fn process_multi_proof<P: ProofNodes, L: ProofNodes, F: ProofFlags>(
+    proof: P,
+    proof_flags: F,
+    leaves: L,
+) -> u256 {
+    let proof_nodes = proof.nodes()
+    let leaf_nodes = leaves.nodes()
+    let proof_len = proof_nodes.len()
+    let leaf_len = leaf_nodes.len()
+    let flag_len = proof_flags.flag_len()
+
+    assert!(
+        (leaf_len as u256) + (proof_len as u256) == (flag_len as u256) + 1,
+        "invalid multiproof: length mismatch",
+    )
+
+    if flag_len == 0 {
+        // The length equation leaves exactly one node across `leaves` and
+        // `proof`; that node is the root.
+        if leaf_len > 0 {
+            return leaf_nodes[0]
+        }
+        return proof_nodes[0]
+    }
+
+    var hashes = unsafe {
+        ptr::alloc_array<u256>(flag_len)
+    }
+    var leaf_pos: usize = 0
+    var hash_pos: usize = 0
+    var proof_pos: usize = 0
+    var i: usize = 0
+    while i < flag_len {
+        // `a` always comes from the queue: the next leaf while any remain,
+        // else a hash computed by an earlier step. Only hashes written by
+        // earlier steps are readable; anything else is a malformed proof.
+        let a = if leaf_pos < leaf_len {
+            let v = leaf_nodes[leaf_pos]
+            leaf_pos += 1
+            v
+        } else {
+            assert!(hash_pos < i, "invalid multiproof: queue underflow")
+            let v = hashes[hash_pos]
+            hash_pos += 1
+            v
+        }
+        let b = if proof_flags.flag_at(i) {
+            if leaf_pos < leaf_len {
+                let v = leaf_nodes[leaf_pos]
+                leaf_pos += 1
+                v
+            } else {
+                assert!(hash_pos < i, "invalid multiproof: queue underflow")
+                let v = hashes[hash_pos]
+                hash_pos += 1
+                v
+            }
+        } else {
+            assert!(
+                proof_pos < proof_len,
+                "invalid multiproof: proof exhausted",
+            )
+            let v = proof_nodes[proof_pos]
+            proof_pos += 1
+            v
+        }
+        hashes[i] = merkle::hash_pair_sorted(a, b)
+        i += 1
+    }
+    assert!(
+        proof_pos == proof_len,
+        "invalid multiproof: unconsumed proof",
+    )
+    hashes[flag_len - 1]
+}
+
+/// Whether `leaves` are simultaneously proven parts of the tree with
+/// `root` by this multiproof: `process_multi_proof(...) == root`.
+///
+/// Same as OpenZeppelin `MerkleProof.multiProofVerify`. Note the empty-set
+/// case: with no leaves and `proof == [root]` this returns `true`; validate
+/// the leaves independently when that matters.
+pub fn verify_multi_proof<P: ProofNodes, L: ProofNodes, F: ProofFlags>(
+    proof: P,
+    proof_flags: F,
+    root: u256,
+    leaves: L,
+) -> bool {
+    process_multi_proof(proof, proof_flags, leaves) == root
+}
+
+/// `keccak256(keccak256(abi.encode(words...)))`: the leaf encoding of
+/// OpenZeppelin's standard Merkle tree for word-sized values.
+///
+/// For a distributor leaf of `(index, account, amount)` this is
+/// `leaf_from_words([index, account.word(), amount])`, which matches the
+/// leaf `@openzeppelin/merkle-tree` builds for the same values. The double
+/// hash keeps leaves in a different domain from internal nodes (see the
+/// module docs). Evaluates at compile time for constant inputs.
+pub const fn leaf_from_words<const N: usize>(_ words: [u256; N]) -> u256 {
+    crypto::keccak_words([crypto::keccak_words(words)])
+}
+
+/// `keccak256(keccak256(data))`: the double hash over arbitrary byte data.
+pub fn double_keccak(_ data: MemSpan) -> u256 {
+    crypto::keccak_words([crypto::keccak256(data)])
+}
+
+/// `keccak256(keccak256(abi.encodePacked(value)))`: the double hash over a
+/// tightly packed encoding, for leaves whose fields are not all word-sized
+/// (addresses, short integers, byte strings).
+///
+/// Note this differs from `leaf_from_words`: packed encoding drops the
+/// padding, so the two helpers produce different leaves for the same
+/// values. Pick one encoding per tree and build the tree with it.
+pub fn leaf_from_packed<T: EncodePacked>(_ value: own T) -> u256 {
+    crypto::keccak_words([keccak_packed(value)])
+}

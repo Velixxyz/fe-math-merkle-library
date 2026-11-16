@@ -1,0 +1,229 @@
+//! MerkleDistributor: a demo contract for the library.
+//!
+//! A Merkle-gated distributor that pays out ETH claims. Each allocation is
+//! a leaf `keccak256(keccak256(abi.encode(index, account, amount)))` — the
+//! standard-tree encoding from `multiproof::leaf_from_words` — and claims
+//! verify against a single stored root with `std::evm::merkle` (single
+//! claims) or `multiproof::verify_multi_proof` (batch claims).
+//!
+//! Payouts run through the fixed-point library: the claimable amount is
+//! scaled by the linear vesting fraction (`fixedx::vested_fraction`) and
+//! then by the fee (`1 - fee`), both in `Wad` arithmetic, so a claim part
+//! way through the schedule pays part of its allocation. Fund the contract
+//! after deployment with the payable `fund()` message; its balance pays
+//! the claims. A claim that exceeds the balance reverts and leaves nothing
+//! marked as claimed.
+//!
+//! The contract is a demo, not an audited distributor: it has no owner, no
+//! root rotation, and no rescue function. Its job is to show the library
+//! modules composed in a realistic flow, end to end.
+
+use core::fixed::Wad
+use core::ptr::{self}
+use std::abi::DynArray
+use std::evm::merkle
+use std::evm::wei
+use ingot::fixedx::{UFixedExt, vested_fraction}
+use ingot::multiproof::{self, leaf_from_words}
+
+msg DistributorMsg {
+    #[selector = sol("fund()")]
+    Fund -> u256,
+    #[selector = sol("claim(uint256[],uint256,address,uint256)")]
+    Claim { proof: DynArray<u256>, index: u256, account: Address, amount: u256 } -> u256,
+    #[selector = sol(
+        "claimMulti(uint256[],bool[],uint256[],address[],uint256[])",
+    )]
+    ClaimMulti {
+        proof: DynArray<u256>,
+        proof_flags: DynArray<bool>,
+        indices: DynArray<u256>,
+        accounts: DynArray<Address>,
+        amounts: DynArray<u256>,
+    } -> u256,
+    #[selector = sol("root()")]
+    Root -> u256,
+    #[selector = sol("isClaimed(uint256)")]
+    IsClaimed { index: u256 } -> bool,
+    #[selector = sol("vestedFraction()")]
+    VestedFraction -> u256,
+    #[selector = sol("totalClaimed()")]
+    TotalClaimed -> u256,
+}
+
+#[event]
+struct Claimed {
+    #[indexed]
+    account: Address,
+    index: u256,
+    amount: u256,
+    payout: u256,
+}
+
+/// The wei payable for `amount` right now: vested, then fee-adjusted.
+fn payout_for(_ amount: u256, _ now: u256, _ start: u256, _ end: u256, _ fee: Wad) -> u256 {
+    let vested = vested_fraction(start, end, now)
+    let after_vesting = vested.mul_int(amount).floor_int()
+    (Wad::one() - fee).mul_int(after_vesting).floor_int()
+}
+
+pub contract MerkleDistributor uses (ctx: Ctx, call: mut Call, log: mut Log) {
+    root: u256,
+    vesting_start: u256,
+    vesting_end: u256,
+    fee_raw: u256,
+    mut claimed: StorageMap<u256, bool>,
+    mut total_claimed: u256,
+
+    init(root_value: u256, start: u256, end: u256, fee_value: u256)
+    uses (mut root, mut vesting_start, mut vesting_end, mut fee_raw, mut total_claimed)
+    {
+        assert!(fee_value <= Wad::SCALE, "fee exceeds 100%")
+        root = root_value
+        vesting_start = start
+        vesting_end = end
+        fee_raw = fee_value
+        total_claimed = 0
+    }
+
+    recv DistributorMsg {
+        #[payable]
+        Fund -> u256 uses (ctx) {
+            ctx.selfbalance().as_wei()
+        }
+
+        Claim { proof, index, account, amount } -> u256
+        uses (
+            ctx,
+            mut call,
+            root,
+            vesting_start,
+            vesting_end,
+            fee_raw,
+            mut claimed,
+            mut total_claimed,
+            mut log,
+        )
+        {
+            assert!(!claimed.get(key: index), "already claimed")
+            let leaf = leaf_from_words([index, account.word(), amount])
+            assert!(
+                merkle::verify(proof: proof, root: root, leaf: leaf),
+                "invalid proof",
+            )
+            let payout = payout_for(
+                amount,
+                ctx.timestamp().as_seconds(),
+                vesting_start,
+                vesting_end,
+                Wad::from_raw(fee_raw),
+            )
+            // Effects before interaction: mark claimed before sending, so
+            // a reentrant call finds nothing.
+            claimed.set(key: index, value: true)
+            total_claimed = total_claimed + payout
+            if payout > 0 {
+                assert!(
+                    call.send_value(addr: account, gas: 0, value: wei(payout)).success(),
+                    "payout failed",
+                )
+            }
+            log.emit(Claimed { account, index, amount, payout })
+            payout
+        }
+
+        ClaimMulti { proof, proof_flags, indices, accounts, amounts } -> u256
+        uses (
+            ctx,
+            mut call,
+            root,
+            vesting_start,
+            vesting_end,
+            fee_raw,
+            mut claimed,
+            mut total_claimed,
+            mut log,
+        )
+        {
+            let n = indices.len()
+            assert!(n > 0, "empty batch")
+            assert!(
+                accounts.len() == n && amounts.len() == n,
+                "batch length mismatch",
+            )
+
+            // Build the leaves and reject already-claimed indices before
+            // verifying, so a batch never half-succeeds.
+            var leaves = unsafe {
+                ptr::alloc_array<u256>(n)
+            }
+            var i: usize = 0
+            while i < n {
+                let index = indices.get(i)
+                assert!(!claimed.get(key: index), "already claimed")
+                leaves[i] = leaf_from_words([index, accounts.get(i).word(), amounts.get(i)])
+                i += 1
+            }
+            assert!(
+                multiproof::verify_multi_proof(
+                    proof: proof,
+                    proof_flags: proof_flags,
+                    root: root,
+                    leaves: leaves.as_slice(),
+                ),
+                "invalid multiproof",
+            )
+
+            // Mark every index claimed and compute every payout before any
+            // ETH moves.
+            var payouts = unsafe {
+                ptr::alloc_array<u256>(n)
+            }
+            let now = ctx.timestamp().as_seconds()
+            let fee = Wad::from_raw(fee_raw)
+            var total: u256 = 0
+            var j: usize = 0
+            while j < n {
+                let index = indices.get(j)
+                let payout = payout_for(amounts.get(j), now, vesting_start, vesting_end, fee)
+                claimed.set(key: index, value: true)
+                payouts[j] = payout
+                total += payout
+                log.emit(
+                    Claimed { account: accounts.get(j), index, amount: amounts.get(j), payout },
+                )
+                j += 1
+            }
+            total_claimed = total_claimed + total
+
+            var k: usize = 0
+            while k < n {
+                if payouts[k] > 0 {
+                    assert!(
+                        call.send_value(addr: accounts.get(k), gas: 0, value: wei(payouts[k]))
+                            .success(),
+                        "payout failed",
+                    )
+                }
+                k += 1
+            }
+            total
+        }
+
+        Root -> u256 uses (root) {
+            root
+        }
+
+        IsClaimed { index } -> bool uses (claimed) {
+            claimed.get(key: index)
+        }
+
+        VestedFraction -> u256 uses (ctx, vesting_start, vesting_end) {
+            vested_fraction(vesting_start, vesting_end, ctx.timestamp().as_seconds()).raw()
+        }
+
+        TotalClaimed -> u256 uses (total_claimed) {
+            total_claimed
+        }
+    }
+}

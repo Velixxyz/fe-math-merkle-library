@@ -1,0 +1,157 @@
+//! Fixed-point extensions over `core::fixed`.
+//!
+//! `core::fixed` ships the core types (`UFixed<D>`, `Fixed<D>`, `Wad`,
+//! `Ray`, `SWad`) with down/up rounding, rescaling, `sqrt`, integer powers,
+//! and the 18-decimal `exp`/`ln`/`powf`. This module adds the operations a
+//! DeFi builder reaches for next, without duplicating any of it:
+//!
+//! * **Rounding to nearest** — `mul_div_nearest` and the `mul_nearest` /
+//!   `div_nearest` methods: half-up rounding for the cases where always
+//!   rounding down (or up) biases a result, e.g. splitting a pot evenly.
+//! * **Safe aggregation** — `clamp`, overflow-safe `avg`, and
+//!   `geometric_mean`, the three bounds/averages that have no checked form
+//!   in std.
+//! * **Growth math** — `pow_signed` (negative exponents), `compound` and
+//!   `discount` (repeated growth / present value over std's integer `**`),
+//!   `sqrt_abs` for signed values, and `vested_fraction` for linear
+//!   schedules.
+//!
+//! Everything here is specified in terms of `core::fixed` and
+//! `core::num` primitives, so the rounding at each step is the rounding
+//! those primitives document — no hidden precision changes. The test
+//! vectors in `vectors/fixed_vectors.json` were computed with Python
+//! exact integer arithmetic from the same specifications; this module is
+//! not its own oracle.
+
+use core::fixed::{SWad, UFixed, Wad}
+use core::num::{checked_mul_div, mul_div, mulmod}
+
+/// `a * b / d` with a 512-bit intermediate product, rounded to nearest,
+/// ties away from zero (up).
+///
+/// `core::num` has `mul_div` (round down) and `mul_div_ceil` (round up);
+/// this is the third rounding mode. Fails like checked arithmetic: division
+/// by zero if `d == 0`, overflow if the rounded result does not fit.
+pub const fn mul_div_nearest(_ a: u256, _ b: u256, _ d: u256) -> u256 {
+    let quotient = mul_div(a, b, d)
+    let remainder = mulmod(a, b, d)
+    // `2 * remainder >= d`, without overflowing the doubling: `remainder`
+    // is below `d`, so `remainder >= d - remainder` is the same test.
+    if remainder >= d - remainder {
+        quotient + 1
+    } else {
+        quotient
+    }
+}
+
+/// Checked `mul_div_nearest`: `None` when `d == 0` or the rounded result
+/// does not fit in a `u256`.
+pub const fn checked_mul_div_nearest(_ a: u256, _ b: u256, _ d: u256) -> Option<u256> {
+    match checked_mul_div(a, b, d) {
+        None => None,
+        Some(quotient) => {
+            let remainder = mulmod(a, b, d)
+            if remainder >= d - remainder {
+                if quotient == u256::max() {
+                    None
+                } else {
+                    Some(quotient + 1)
+                }
+            } else {
+                Some(quotient)
+            }
+        },
+    }
+}
+
+/// Rounding, bounds, and growth operations for unsigned fixed-point
+/// numbers, at every scale.
+pub trait UFixedExt {
+    /// `self * other`, rounded to nearest (ties up).
+    fn mul_nearest(own self, _ other: own Self) -> Self
+    /// `self / other`, rounded to nearest (ties up).
+    fn div_nearest(own self, _ other: own Self) -> Self
+    /// `self` clamped to `[min, max]`. Fails if `min > max`.
+    fn clamp(own self, _ min: own Self, _ max: own Self) -> Self
+    /// The average of `self` and `other`, rounded down, computed without
+    /// overflow for any inputs.
+    fn avg(own self, _ other: own Self) -> Self
+    /// `sqrt(self * other)`, rounded down. The product rounds down first
+    /// (std's `*`), then the root rounds down (std's `sqrt`), so the
+    /// result is within 2 raw units of the exact root.
+    fn geometric_mean(own self, _ other: own Self) -> Self
+    /// `self ** exp`, including negative exponents: `self ** -n` is the
+    /// reciprocal `1 / (self ** n)`. Fails for `0` raised to a negative
+    /// exponent, and when an intermediate power overflows.
+    fn pow_signed(own self, _ exp: own i256) -> Self
+    /// `self * (1 + rate) ** periods`: compound growth. Each squaring in
+    /// the power rounds half-up (std's `**`), the final product rounds
+    /// down (std's `*`).
+    fn compound(own self, _ rate: own Self, _ periods: own u256) -> Self
+    /// `self / (1 + rate) ** periods`: present value under compound
+    /// growth. Same step rounding as `compound`.
+    fn discount(own self, _ rate: own Self, _ periods: own u256) -> Self
+}
+
+impl<const D: u256> UFixedExt for UFixed<D> {
+    fn mul_nearest(own self, _ other: own Self) -> Self {
+        Self::from_raw(mul_div_nearest(self.raw(), other.raw(), Self::SCALE))
+    }
+    fn div_nearest(own self, _ other: own Self) -> Self {
+        Self::from_raw(mul_div_nearest(self.raw(), Self::SCALE, other.raw()))
+    }
+    fn clamp(own self, _ min: own Self, _ max: own Self) -> Self {
+        assert!(min.raw() <= max.raw(), "clamp: min exceeds max")
+        if self.raw() < min.raw() {
+            min
+        } else if self.raw() > max.raw() { max } else { self }
+    }
+    fn avg(own self, _ other: own Self) -> Self {
+        // `(a + b) / 2` without ever forming `a + b`:
+        // `(a & b) + ((a ^ b) >> 1)` is exactly `floor((a + b) / 2)`.
+        let a = self.raw()
+        let b = other.raw()
+        Self::from_raw((a & b) + ((a ^ b) >> 1))
+    }
+    fn geometric_mean(own self, _ other: own Self) -> Self {
+        (self * other).sqrt()
+    }
+    fn pow_signed(own self, _ exp: own i256) -> Self {
+        if exp == 0 {
+            return Self::one()
+        }
+        let powered = self ** exp.unsigned_abs()
+        if exp < 0 {
+            Self::one() / powered
+        } else {
+            powered
+        }
+    }
+    fn compound(own self, _ rate: own Self, _ periods: own u256) -> Self {
+        self * ((Self::one() + rate) ** periods)
+    }
+    fn discount(own self, _ rate: own Self, _ periods: own u256) -> Self {
+        self / ((Self::one() + rate) ** periods)
+    }
+}
+
+/// `sqrt(abs(x))` for signed 18-decimal fixed point: the root of the
+/// magnitude, as an unsigned wad. `core::fixed` has `sqrt` only for
+/// unsigned values; this is its signed counterpart.
+pub fn sqrt_abs(_ x: SWad) -> Wad {
+    x.abs().sqrt()
+}
+
+/// The vested fraction of a linear schedule at time `now`: `0` at or
+/// before `start`, `1` at or after `end`, linear in between. A degenerate
+/// schedule (`end <= start`) counts as fully vested, so callers can disable
+/// vesting by passing an empty window.
+pub fn vested_fraction(_ start: u256, _ end: u256, _ now: u256) -> Wad {
+    if end <= start || now >= end {
+        return Wad::one()
+    }
+    if now <= start {
+        return Wad::zero()
+    }
+    Wad::from_ratio(now - start, end - start)
+}

@@ -1,0 +1,662 @@
+// Smoke tests: compilation + plumbing. The full vector suites live in
+// `tests_vectors.fe` (generated) and the EVM distributor tests below.
+
+use core::fixed::Wad
+use core::ptr::{self, MemSlice}
+use std::abi::DynArray
+use std::evm::{ether, merkle, wei}
+use ingot::fixedx::{UFixedExt, checked_mul_div_nearest, mul_div_nearest}
+use ingot::multiproof::{self, leaf_from_words}
+use ingot::{DistributorMsg, MerkleDistributor}
+
+fn words<const N: usize>(_ values: [u256; N]) -> ref MemSlice<u256> {
+    var array = unsafe {
+        ptr::alloc_array<u256>(N)
+    }
+    var i: usize = 0
+    for value in values {
+        array[i] = value
+        i += 1
+    }
+    array.as_slice()
+}
+
+fn empty_words() -> ref MemSlice<u256> {
+    MemSlice<u256>::empty()
+}
+
+#[test]
+fn smoke_mul_div_nearest() {
+    // 1/2 rounds up; 3/2 rounds up; 1/3 rounds down.
+    assert!(mul_div_nearest(1, 1, 2) == 1)
+    assert!(mul_div_nearest(3, 1, 2) == 2)
+    assert!(mul_div_nearest(1, 1, 3) == 0)
+    assert!(checked_mul_div_nearest(1, 1, 0) == None)
+    assert!(checked_mul_div_nearest(1, 1, 2) == Some(1))
+}
+
+#[test]
+fn smoke_wad_extensions() {
+    // 1e-18 * 0.5 = 0.5e-18, ties round up to 1 raw unit.
+    assert!(
+        Wad::from_raw(1).mul_nearest(Wad::from_ratio(1, 2)) == Wad::from_raw(1),
+    )
+    // 1e-18 * 0.4 = 0.4e-18 rounds down to 0.
+    assert!(
+        Wad::from_raw(1).mul_nearest(Wad::from_ratio(2, 5)) == Wad::from_raw(0),
+    )
+    assert!(
+        Wad::from_int(2).avg(Wad::from_int(5)) == Wad::from_ratio(7, 2),
+    )
+    assert!(
+        Wad::from_int(4).geometric_mean(Wad::from_int(9)) == Wad::from_int(6),
+    )
+    assert!(Wad::from_int(2).pow_signed(-1) == Wad::from_ratio(1, 2))
+}
+
+#[test]
+fn smoke_multiproof_two_leaves() {
+    // Fixture-known pair: keccak256(0), keccak256(1), and their sorted-pair
+    // root (see std's merkle_proof fixture).
+    let leaf0: u256 = 0x290decd9548b62a8d60345a988386fc84ba6bc95484008f6362f93160ef3e563
+    let leaf1: u256 = 0xb10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf6
+    let root: u256 = 0x891370df4fadf33f50e41f7c8a791e680c0655695ea3404385a909c8f5e13fb4
+    let leaves = words([leaf0, leaf1])
+    let flags = words([1])
+    assert!(
+        multiproof::process_multi_proof(proof: empty_words(), proof_flags: flags, leaves: leaves)
+            == root,
+    )
+    assert!(
+        multiproof::verify_multi_proof(
+            proof: empty_words(),
+            proof_flags: flags,
+            root: root,
+            leaves: leaves,
+        ),
+    )
+    // The same two leaves in the other order hash to the same root: the
+    // pair hash is commutative.
+    let swapped = words([leaf1, leaf0])
+    assert!(
+        multiproof::verify_multi_proof(
+            proof: empty_words(),
+            proof_flags: flags,
+            root: root,
+            leaves: swapped,
+        ),
+    )
+}
+
+#[test]
+fn smoke_leaf_encoding_matches_python() {
+    // Independent ground truth: Python hashlib-equivalent keccak256 of the
+    // double hash over abi.encode(index, account, amount).
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    let bob = Address::new(0x2222222222222222222222222222222222222222)
+    assert!(
+        leaf_from_words([0, alice.word(), 1_000_000_000_000_000_000])
+            == 0xeb728624ae06a51d14c3864a1c4dbf39cfa562f9784e4091328aa6ce23ae25bd,
+    )
+    assert!(
+        leaf_from_words([1, bob.word(), 2_000_000_000_000_000_000])
+            == 0x8579799b5c67dcec21d21ae1c8477298b53a160085db3bc8b811c8388e3191f6,
+    )
+    assert!(
+        merkle::hash_pair_sorted(
+                leaf_from_words([0, alice.word(), 1_000_000_000_000_000_000]),
+                leaf_from_words([1, bob.word(), 2_000_000_000_000_000_000]),
+            )
+            == 0x7123729d69a74c15fcaae2590a4bca47eb9e0bc1e2ee24acdf98a0f69c469c6e,
+    )
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn smoke_distributor_deploy_only() uses (evm: mut Evm) {
+    let root: u256 = 0x7123729d69a74c15fcaae2590a4bca47eb9e0bc1e2ee24acdf98a0f69c469c6e
+    let funded = evm.create2<MerkleDistributor>(value: Wei::zero(), args: (root, 0, 0, 0), salt: 1)
+    assert!(funded.word() != 0)
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn smoke_distributor_reads() uses (evm: mut Evm) {
+    let root: u256 = 0x7123729d69a74c15fcaae2590a4bca47eb9e0bc1e2ee24acdf98a0f69c469c6e
+    let funded = evm.create2<MerkleDistributor>(value: Wei::zero(), args: (root, 0, 0, 0), salt: 1)
+    let stored: u256 = evm
+        .call(
+            addr: funded,
+            gas: 100000,
+            value: Wei::zero(),
+            message: DistributorMsg::Root {},
+        )
+    assert!(stored == root)
+    let claimed: bool = evm
+        .call(
+            addr: funded,
+            gas: 100000,
+            value: Wei::zero(),
+            message: DistributorMsg::IsClaimed { index: 0 },
+        )
+    assert!(!claimed)
+    let fraction: u256 = evm
+        .call(
+            addr: funded,
+            gas: 100000,
+            value: Wei::zero(),
+            message: DistributorMsg::VestedFraction {},
+        )
+    assert!(fraction == Wad::SCALE)
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn smoke_distributor_claim() uses (evm: mut Evm) {
+    // Two allocations; the tree is built with the library itself (plumbing
+    // only — correctness vectors come from Python, see tests_vectors.fe).
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    let bob = Address::new(0x2222222222222222222222222222222222222222)
+    let leaf_a = leaf_from_words([0, alice.word(), 1_000_000_000_000_000_000])
+    let leaf_b = leaf_from_words([1, bob.word(), 2_000_000_000_000_000_000])
+    let root = merkle::hash_pair_sorted(leaf_a, leaf_b)
+
+    // No vesting (empty window), no fee: claims pay the full allocation.
+    // Deployed unfunded, then funded via the payable `fund()` message.
+    let funded = evm.create2<MerkleDistributor>(value: Wei::zero(), args: (root, 0, 0, 0), salt: 1)
+    let balance: u256 = evm
+        .call(
+            addr: funded,
+            gas: 100000,
+            value: ether(5),
+            message: DistributorMsg::Fund {},
+        )
+    assert!(balance == 5_000_000_000_000_000_000)
+
+    let proof = words([leaf_b])
+    let payout: u256 = evm
+        .call(
+            addr: funded,
+            gas: 300000,
+            value: Wei::zero(),
+            message: DistributorMsg::Claim {
+                proof: proof_to_dynarray(proof),
+                index: 0,
+                account: alice,
+                amount: 1_000_000_000_000_000_000,
+            },
+        )
+    assert!(payout == 1_000_000_000_000_000_000)
+    assert!(evm.balance(alice) == ether(1))
+    let claimed: bool = evm
+        .call(
+            addr: funded,
+            gas: 100000,
+            value: Wei::zero(),
+            message: DistributorMsg::IsClaimed { index: 0 },
+        )
+    assert!(claimed)
+}
+
+fn proof_to_dynarray(_ proof: ref MemSlice<u256>) -> DynArray<u256> {
+    DynArray::from_slice(proof)
+}
+
+fn bools_dyn<const N: usize>(_ values: [bool; N]) -> DynArray<bool> {
+    var array = unsafe {
+        ptr::alloc_array<bool>(N)
+    }
+    var i: usize = 0
+    for value in values {
+        array[i] = value
+        i += 1
+    }
+    DynArray::from_slice(array.as_slice())
+}
+
+fn addrs_dyn<const N: usize>(_ values: [Address; N]) -> DynArray<Address> {
+    var array = unsafe {
+        ptr::alloc_array<Address>(N)
+    }
+    var i: usize = 0
+    for value in values {
+        array[i] = value
+        i += 1
+    }
+    DynArray::from_slice(array.as_slice())
+}
+
+// The 4-leaf distributor tree from vectors/merkle_vectors.json, computed
+// independently in Python. Root and leaves are ground truth here, not
+// recomputed with the library.
+fn deploy_tree4(_ start: u256, _ end: u256, _ fee: u256, _ fund: u256) -> Address
+uses (evm: mut Evm)
+{
+    let root: u256 = 0x8a0793ea3c3790c59a9d8fbde3c6fb9fe6ef4f4f13b4ec0c9e02f910024c07ad
+    let distributor = evm
+        .create2<MerkleDistributor>(value: Wei::zero(), args: (root, start, end, fee), salt: 7)
+    let balance: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 100000,
+            value: wei(fund),
+            message: DistributorMsg::Fund {},
+        )
+    assert!(balance == fund)
+    distributor
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn distributor_claim_independent() uses (evm: mut Evm) {
+    let distributor = deploy_tree4(0, 0, 0, ether(5).as_wei())
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    // Single proof for leaf 0: [leaf1, hash(leaf2, leaf3)].
+    let proof = words(
+        [
+            0x647dc7437e02fd27e50f72e3bb9edfb29349b80dba3beb9399e592eec7e26b50,
+            0x04d015752dc2e032305c43ea9f20ffae4dcb3a7e3f8bfdaa4d095965f9c2b28f,
+        ],
+    )
+    let payout: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 300000,
+            value: Wei::zero(),
+            message: DistributorMsg::Claim {
+                proof: proof_to_dynarray(proof),
+                index: 0,
+                account: alice,
+                amount: 250000000000000000,
+            },
+        )
+    assert!(payout == 250000000000000000)
+    assert!(evm.balance(alice) == wei(250000000000000000))
+    let total: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 100000,
+            value: Wei::zero(),
+            message: DistributorMsg::TotalClaimed {},
+        )
+    assert!(total == 250000000000000000)
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn distributor_double_claim_reverts() uses (evm: mut Evm) {
+    let distributor = deploy_tree4(0, 0, 0, ether(5).as_wei())
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    let claim_proof = words(
+        [
+            0x647dc7437e02fd27e50f72e3bb9edfb29349b80dba3beb9399e592eec7e26b50,
+            0x04d015752dc2e032305c43ea9f20ffae4dcb3a7e3f8bfdaa4d095965f9c2b28f,
+        ],
+    )
+    let _: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 300000,
+            value: Wei::zero(),
+            message: DistributorMsg::Claim {
+                proof: proof_to_dynarray(claim_proof),
+                index: 0,
+                account: alice,
+                amount: 250000000000000000,
+            },
+        )
+    // The second claim of the same index must revert.
+    let _: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 300000,
+            value: Wei::zero(),
+            message: DistributorMsg::Claim {
+                proof: proof_to_dynarray(claim_proof),
+                index: 0,
+                account: alice,
+                amount: 250000000000000000,
+            },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn distributor_bad_proof_reverts() uses (evm: mut Evm) {
+    let distributor = deploy_tree4(0, 0, 0, ether(5).as_wei())
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    // First proof element tampered: the low bit of leaf1 is flipped.
+    let proof = words(
+        [
+            0x647dc7437e02fd27e50f72e3bb9edfb29349b80dba3beb9399e592eec7e26b51,
+            0x04d015752dc2e032305c43ea9f20ffae4dcb3a7e3f8bfdaa4d095965f9c2b28f,
+        ],
+    )
+    let _: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 300000,
+            value: Wei::zero(),
+            message: DistributorMsg::Claim {
+                proof: proof_to_dynarray(proof),
+                index: 0,
+                account: alice,
+                amount: 250000000000000000,
+            },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn distributor_wrong_amount_reverts() uses (evm: mut Evm) {
+    let distributor = deploy_tree4(0, 0, 0, ether(5).as_wei())
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    let proof = words(
+        [
+            0x647dc7437e02fd27e50f72e3bb9edfb29349b80dba3beb9399e592eec7e26b50,
+            0x04d015752dc2e032305c43ea9f20ffae4dcb3a7e3f8bfdaa4d095965f9c2b28f,
+        ],
+    )
+    let _: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 300000,
+            value: Wei::zero(),
+            message: DistributorMsg::Claim {
+                proof: proof_to_dynarray(proof),
+                index: 0,
+                account: alice,
+                amount: 250000000000000001,
+            },
+        )
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn distributor_claim_multi_pair() uses (evm: mut Evm) {
+    let distributor = deploy_tree4(0, 0, 0, ether(5).as_wei())
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    let bob = Address::new(0x2222222222222222222222222222222222222222)
+    // Multiproof for leaves [0, 1]: one proof node, flags [true, false].
+    let proof = words(
+        [0x04d015752dc2e032305c43ea9f20ffae4dcb3a7e3f8bfdaa4d095965f9c2b28f],
+    )
+    let total: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 500000,
+            value: Wei::zero(),
+            message: DistributorMsg::ClaimMulti {
+                proof: proof_to_dynarray(proof),
+                proof_flags: bools_dyn([true, false]),
+                indices: proof_to_dynarray(words([0, 1])),
+                accounts: addrs_dyn([alice, bob]),
+                amounts: proof_to_dynarray(words([250000000000000000, 500000000000007919])),
+            },
+        )
+    assert!(total == 750000000000007919)
+    assert!(evm.balance(alice) == wei(250000000000000000))
+    assert!(evm.balance(bob) == wei(500000000000007919))
+    let claimed1: bool = evm
+        .call(
+            addr: distributor,
+            gas: 100000,
+            value: Wei::zero(),
+            message: DistributorMsg::IsClaimed { index: 1 },
+        )
+    assert!(claimed1)
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn distributor_claim_multi_all() uses (evm: mut Evm) {
+    let distributor = deploy_tree4(0, 0, 0, ether(5).as_wei())
+    let accounts = addrs_dyn(
+        [
+            Address::new(0x1111111111111111111111111111111111111111),
+            Address::new(0x2222222222222222222222222222222222222222),
+            Address::new(0x3333333333333333333333333333333333333333),
+            Address::new(0x4444444444444444444444444444444444444444),
+        ],
+    )
+    // All four leaves: empty proof, flags [true, true, true].
+    let total: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 500000,
+            value: Wei::zero(),
+            message: DistributorMsg::ClaimMulti {
+                proof: proof_to_dynarray(empty_words()),
+                proof_flags: bools_dyn([true, true, true]),
+                indices: proof_to_dynarray(words([0, 1, 2, 3])),
+                accounts: accounts,
+                amounts: proof_to_dynarray(
+                    words(
+                        [
+                            250000000000000000,
+                            500000000000007919,
+                            750000000000015838,
+                            1000000000000023757,
+                        ],
+                    ),
+                ),
+            },
+        )
+    assert!(total == 2500000000000047514)
+    let stored: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 100000,
+            value: Wei::zero(),
+            message: DistributorMsg::TotalClaimed {},
+        )
+    assert!(stored == 2500000000000047514)
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn distributor_claim_multi_bad_flags_reverts() uses (evm: mut Evm) {
+    let distributor = deploy_tree4(0, 0, 0, ether(5).as_wei())
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    let bob = Address::new(0x2222222222222222222222222222222222222222)
+    // Flags [true, true] with one proof node: the second flag consumes a
+    // queue item that does not exist, so the multiproof walk reverts.
+    let proof = words(
+        [0x04d015752dc2e032305c43ea9f20ffae4dcb3a7e3f8bfdaa4d095965f9c2b28f],
+    )
+    let _: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 500000,
+            value: Wei::zero(),
+            message: DistributorMsg::ClaimMulti {
+                proof: proof_to_dynarray(proof),
+                proof_flags: bools_dyn([true, true]),
+                indices: proof_to_dynarray(words([0, 1])),
+                accounts: addrs_dyn([alice, bob]),
+                amounts: proof_to_dynarray(words([250000000000000000, 500000000000007919])),
+            },
+        )
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn distributor_fee_exact() uses (evm: mut Evm) {
+    // Degenerate window (end <= start) forces vesting fraction 1 whatever
+    // the block timestamp is; a 25% fee must leave exactly 75%.
+    let distributor = deploy_tree4(100, 100, 250000000000000000, ether(5).as_wei())
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    let proof = words(
+        [
+            0x647dc7437e02fd27e50f72e3bb9edfb29349b80dba3beb9399e592eec7e26b50,
+            0x04d015752dc2e032305c43ea9f20ffae4dcb3a7e3f8bfdaa4d095965f9c2b28f,
+        ],
+    )
+    let payout: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 300000,
+            value: Wei::zero(),
+            message: DistributorMsg::Claim {
+                proof: proof_to_dynarray(proof),
+                index: 0,
+                account: alice,
+                amount: 250000000000000000,
+            },
+        )
+    assert!(payout == 187500000000000000)
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn distributor_zero_vesting() uses (evm: mut Evm) {
+    // Window end 2^200: the fraction is exactly 0 for any realistic block
+    // timestamp, so the claim pays 0 but still marks the index claimed.
+    let distributor = deploy_tree4(0, 2 ** 200, 0, ether(5).as_wei())
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    let proof = words(
+        [
+            0x647dc7437e02fd27e50f72e3bb9edfb29349b80dba3beb9399e592eec7e26b50,
+            0x04d015752dc2e032305c43ea9f20ffae4dcb3a7e3f8bfdaa4d095965f9c2b28f,
+        ],
+    )
+    let payout: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 300000,
+            value: Wei::zero(),
+            message: DistributorMsg::Claim {
+                proof: proof_to_dynarray(proof),
+                index: 0,
+                account: alice,
+                amount: 250000000000000000,
+            },
+        )
+    assert!(payout == 0)
+    let claimed: bool = evm
+        .call(
+            addr: distributor,
+            gas: 100000,
+            value: Wei::zero(),
+            message: DistributorMsg::IsClaimed { index: 0 },
+        )
+    assert!(claimed)
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn distributor_partial_vesting_exact() uses (evm: mut Evm) {
+    // Window [0, 10^12): the harness timestamp is strictly inside it, so
+    // the fraction is strictly partial. The test reads the fraction from
+    // the contract, recomputes the payout with plain u256 arithmetic, and
+    // asserts the claim pays exactly that. Timestamp stability within a
+    // test is pinned by distributor_timestamp_stable_within_test.
+    let distributor = deploy_tree4(0, 1_000_000_000_000, 0, ether(5).as_wei())
+    let fraction: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 100000,
+            value: Wei::zero(),
+            message: DistributorMsg::VestedFraction {},
+        )
+    assert!(fraction > 0)
+    assert!(fraction < Wad::SCALE)
+    let expected = (250000000000000000 * fraction) / Wad::SCALE
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    let proof = words(
+        [
+            0x647dc7437e02fd27e50f72e3bb9edfb29349b80dba3beb9399e592eec7e26b50,
+            0x04d015752dc2e032305c43ea9f20ffae4dcb3a7e3f8bfdaa4d095965f9c2b28f,
+        ],
+    )
+    let payout: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 300000,
+            value: Wei::zero(),
+            message: DistributorMsg::Claim {
+                proof: proof_to_dynarray(proof),
+                index: 0,
+                account: alice,
+                amount: 250000000000000000,
+            },
+        )
+    assert!(payout == expected)
+    assert!(payout > 0)
+    assert!(payout < 250000000000000000)
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn distributor_insufficient_balance_reverts() uses (evm: mut Evm) {
+    // Funded with 0.1 ETH; the 0.25 ETH claim's transfer must fail.
+    let distributor = deploy_tree4(0, 0, 0, 100000000000000000)
+    let alice = Address::new(0x1111111111111111111111111111111111111111)
+    let proof = words(
+        [
+            0x647dc7437e02fd27e50f72e3bb9edfb29349b80dba3beb9399e592eec7e26b50,
+            0x04d015752dc2e032305c43ea9f20ffae4dcb3a7e3f8bfdaa4d095965f9c2b28f,
+        ],
+    )
+    let _: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 300000,
+            value: Wei::zero(),
+            message: DistributorMsg::Claim {
+                proof: proof_to_dynarray(proof),
+                index: 0,
+                account: alice,
+                amount: 250000000000000000,
+            },
+        )
+}
+
+#[test]
+fn multiproof_dynarray_containers() {
+    // The multiproof API over DynArray containers (incl. an empty proof),
+    // the exact shapes the ClaimMulti handler uses.
+    let root: u256 = 0x8a0793ea3c3790c59a9d8fbde3c6fb9fe6ef4f4f13b4ec0c9e02f910024c07ad
+    let empty_proof = DynArray::from_slice(empty_words())
+    assert!(empty_proof.len() == 0)
+    let flags = bools_dyn([true, true, true])
+    assert!(flags.len() == 3)
+    let leaves = proof_to_dynarray(
+        words(
+            [
+                0xe0afe6df674ec998ece90d140c5916b331289a76c258163da083e5c1c6403f7b,
+                0x647dc7437e02fd27e50f72e3bb9edfb29349b80dba3beb9399e592eec7e26b50,
+                0x20a62805dd7ead5ce8b3e719dfcf1e7ad3359a12dee8b37b217307b56ec032de,
+                0x28333f592aaf420dc45328a4db42750e6e228bf3318ebbfcafaf9a51e6df52c3,
+            ],
+        ),
+    )
+    assert!(leaves.len() == 4)
+    assert!(
+        multiproof::verify_multi_proof(
+            proof: empty_proof,
+            proof_flags: flags,
+            root: root,
+            leaves: leaves,
+        ),
+    )
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn distributor_timestamp_stable_within_test() uses (evm: mut Evm) {
+    let distributor = deploy_tree4(0, 1_000_000_000_000, 0, 0)
+    let f1: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 100000,
+            value: Wei::zero(),
+            message: DistributorMsg::VestedFraction {},
+        )
+    let f2: u256 = evm
+        .call(
+            addr: distributor,
+            gas: 100000,
+            value: Wei::zero(),
+            message: DistributorMsg::VestedFraction {},
+        )
+    assert!(f1 == f2)
+    assert!(f1 > 0)
+    assert!(f1 < Wad::SCALE)
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn distributor_fee_over_100_reverts() uses (evm: mut Evm) {
+    let root: u256 = 0x8a0793ea3c3790c59a9d8fbde3c6fb9fe6ef4f4f13b4ec0c9e02f910024c07ad
+    let _ = evm
+        .create2<MerkleDistributor>(
+            value: Wei::zero(),
+            args: (root, 0, 0, Wad::SCALE + 1),
+            salt: 7,
+        )
+}
